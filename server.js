@@ -12,9 +12,11 @@ const PORT = process.env.PORT || 8787;
 
 function loadDb() {
   if (!fs.existsSync(DB_PATH)) {
-    return { users: {}, tokens: {}, conversations: {}, messages: {} };
+    return { users: {}, tokens: {}, conversations: {}, messages: {}, scheduled: [] };
   }
-  return JSON.parse(fs.readFileSync(DB_PATH, 'utf8'));
+  var d = JSON.parse(fs.readFileSync(DB_PATH, 'utf8'));
+  if (!d.scheduled) d.scheduled = [];
+  return d;
 }
 function saveDb() {
   fs.writeFileSync(DB_PATH, JSON.stringify(db));
@@ -103,6 +105,28 @@ app.get('/api/conversations/:id/messages', authMiddleware, function (req, res) {
   res.json({ messages: db.messages[req.params.id] || [] });
 });
 
+app.post('/api/schedule', authMiddleware, function (req, res) {
+  var conv = db.conversations[req.body.conversationId];
+  if (!conv || conv.members.indexOf(req.userId) === -1) return res.status(404).json({ error: 'Sohbet bulunamadi.' });
+  var sendAt = Number(req.body.sendAt);
+  if (!sendAt || sendAt < Date.now()) return res.status(400).json({ error: 'Gecerli bir gelecek zaman sec.' });
+  var item = {
+    id: uuid(),
+    conversationId: conv.id,
+    fromUserId: req.userId,
+    kind: req.body.kind || 'text',
+    text: req.body.text,
+    file: req.body.file,
+    voice: req.body.voice,
+    dataUrl: req.body.dataUrl,
+    sendAt: sendAt,
+    delivered: false
+  };
+  db.scheduled.push(item);
+  persist();
+  res.json({ ok: true, id: item.id });
+});
+
 var server = http.createServer(app);
 var wss = new WebSocketServer({ server: server, path: '/ws' });
 var sockets = {};
@@ -115,6 +139,46 @@ function sendTo(userId, payload) {
   set.forEach(function (ws) { if (ws.readyState === 1) { ws.send(json); delivered = true; } });
   return delivered;
 }
+
+function deliverMessage(conv, fromUserId, toUserId, msg) {
+  var sender = db.users[fromUserId];
+  var stored = {
+    id: uuid(),
+    conversationId: conv.id,
+    fromUserId: fromUserId,
+    fromUsername: sender.username,
+    fromDisplayName: sender.displayName,
+    kind: msg.kind || 'text',
+    text: msg.text,
+    file: msg.file,
+    voice: msg.voice,
+    viewOnce: msg.viewOnce,
+    dataUrl: msg.dataUrl,
+    replyTo: msg.replyTo,
+    time: Date.now(),
+    status: 'sent'
+  };
+  db.messages[conv.id] = db.messages[conv.id] || [];
+  db.messages[conv.id].push(stored);
+  persist();
+  var delivered = sendTo(toUserId, { type: 'message', message: stored });
+  stored.status = delivered ? 'delivered' : 'sent';
+  return stored;
+}
+
+setInterval(function () {
+  var now = Date.now();
+  var due = db.scheduled.filter(function (s) { return !s.delivered && s.sendAt <= now; });
+  if (!due.length) return;
+  due.forEach(function (s) {
+    var conv = db.conversations[s.conversationId];
+    if (!conv) { s.delivered = true; return; }
+    var peerId = conv.members.find(function (m) { return m !== s.fromUserId; });
+    deliverMessage(conv, s.fromUserId, peerId, s);
+    s.delivered = true;
+  });
+  persist();
+}, 15000);
 
 wss.on('connection', function (ws, req) {
   var url = new URL(req.url, 'http://x');
@@ -134,28 +198,7 @@ wss.on('connection', function (ws, req) {
     var peerId = conv.members.find(function (m) { return m !== userId; });
 
     if (msg.type === 'message') {
-      var sender = db.users[userId];
-      var stored = {
-        id: uuid(),
-        conversationId: conv.id,
-        fromUserId: userId,
-        fromUsername: sender.username,
-        fromDisplayName: sender.displayName,
-        kind: msg.kind || 'text',
-        text: msg.text,
-        file: msg.file,
-        voice: msg.voice,
-        viewOnce: msg.viewOnce,
-        dataUrl: msg.dataUrl,
-        replyTo: msg.replyTo,
-        time: Date.now(),
-        status: 'sent'
-      };
-      db.messages[conv.id] = db.messages[conv.id] || [];
-      db.messages[conv.id].push(stored);
-      persist();
-      var delivered = sendTo(peerId, { type: 'message', message: stored });
-      stored.status = delivered ? 'delivered' : 'sent';
+      var stored = deliverMessage(conv, userId, peerId, msg);
       ws.send(JSON.stringify({ type: 'ack', localId: msg.localId, message: stored }));
     } else if (msg.type === 'typing') {
       sendTo(peerId, { type: 'typing', conversationId: conv.id, fromUserId: userId });
