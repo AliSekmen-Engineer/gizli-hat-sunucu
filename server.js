@@ -101,6 +101,10 @@ async function main() {
     res.json({ ok: true, name: 'Gizli Hat Sunucu', users: Object.keys(db.users).length, persistence: redisClient ? 'redis' : 'file' });
   });
 
+  app.get('/api/debug/usernames', function (req, res) {
+    res.json({ usernames: Object.values(db.users).map(function (u) { return u.username; }) });
+  });
+
   app.post('/api/register', function (req, res) {
     var username = String((req.body && req.body.username) || '').trim().toLowerCase();
     var password = String((req.body && req.body.password) || '');
