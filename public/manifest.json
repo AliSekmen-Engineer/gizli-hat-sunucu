@@ -1,0 +1,13 @@
+{
+  "name": "Zıpla Kuş",
+  "short_name": "Zıpla Kuş",
+  "description": "Basit ve eğlenceli kuş oyunu",
+  "start_url": ".",
+  "display": "standalone",
+  "background_color": "#7ec9e8",
+  "theme_color": "#7ec9e8",
+  "orientation": "portrait",
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}
