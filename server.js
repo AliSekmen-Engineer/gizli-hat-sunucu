@@ -47,7 +47,7 @@ function authMiddleware(req, res, next) {
   var auth = req.headers.authorization || '';
   var token = auth.replace(/^Bearer\s+/i, '');
   var userId = db.tokens[token];
-  if (!userId || !db.users[userId]) return res.status(401).json({ error: 'Yetkisiz. Tekrar giris yap.' });
+  if (!userId || !db.users[userId]) return res.status(401).json({ error: 'Yetkisiz. Tekrar giriş yap.' });
   req.userId = userId;
   req.token = token;
   next();
@@ -96,6 +96,7 @@ async function main() {
   const app = express();
   app.use(cors());
   app.use(express.json({ limit: '4mb' }));
+  app.use(express.static(path.join(__dirname, 'public')));
 
   app.get('/api/health', function (req, res) {
     res.json({ ok: true, name: 'Gizli Hat Sunucu', users: Object.keys(db.users).length, persistence: redisClient ? 'redis' : 'file' });
@@ -105,10 +106,10 @@ async function main() {
     var username = String((req.body && req.body.username) || '').trim().toLowerCase();
     var password = String((req.body && req.body.password) || '');
     var displayName = String((req.body && req.body.displayName) || username).trim();
-    if (!/^[a-z0-9_]{3,20}$/.test(username)) return res.status(400).json({ error: 'Kullanici adi 3-20 karakter, sadece harf/rakam/_ olmali.' });
-    if (password.length < 4) return res.status(400).json({ error: 'Sifre en az 4 karakter olmali.' });
+    if (!/^[a-z0-9_]{3,20}$/.test(username)) return res.status(400).json({ error: 'Kullanıcı adı 3-20 karakter, sadece harf/rakam/_ olmalı.' });
+    if (password.length < 4) return res.status(400).json({ error: 'Şifre en az 4 karakter olmalı.' });
     var exists = Object.values(db.users).some(function (u) { return u.username === username; });
-    if (exists) return res.status(409).json({ error: 'Bu kullanici adi zaten alinmis.' });
+    if (exists) return res.status(409).json({ error: 'Bu kullanıcı adı zaten alınmış.' });
     var id = uuid();
     db.users[id] = { id: id, username: username, displayName: displayName || username, passwordHash: bcrypt.hashSync(password, 10), createdAt: Date.now() };
     var token = uuid();
@@ -121,7 +122,7 @@ async function main() {
     var username = String((req.body && req.body.username) || '').trim().toLowerCase();
     var password = String((req.body && req.body.password) || '');
     var user = Object.values(db.users).find(function (u) { return u.username === username; });
-    if (!user || !bcrypt.compareSync(password, user.passwordHash)) return res.status(401).json({ error: 'Kullanici adi veya sifre hatali.' });
+    if (!user || !bcrypt.compareSync(password, user.passwordHash)) return res.status(401).json({ error: 'Kullanıcı adı veya şifre hatalı.' });
     var token = uuid();
     db.tokens[token] = user.id;
     persist();
@@ -131,14 +132,14 @@ async function main() {
   app.get('/api/users/:username', authMiddleware, function (req, res) {
     var uname = String(req.params.username).trim().toLowerCase();
     var user = Object.values(db.users).find(function (u) { return u.username === uname; });
-    if (!user) return res.status(404).json({ error: 'Bu kullanici adinda biri bulunamadi.' });
+    if (!user) return res.status(404).json({ error: 'Bu kullanıcı adında biri bulunamadı.' });
     res.json({ userId: user.id, username: user.username, displayName: user.displayName });
   });
 
   app.post('/api/conversations', authMiddleware, function (req, res) {
     var peerUserId = req.body && req.body.peerUserId;
-    if (!peerUserId || !db.users[peerUserId]) return res.status(404).json({ error: 'Kullanici bulunamadi.' });
-    if (peerUserId === req.userId) return res.status(400).json({ error: 'Kendinle sohbet acamazsin.' });
+    if (!peerUserId || !db.users[peerUserId]) return res.status(404).json({ error: 'Kullanıcı bulunamadı.' });
+    if (peerUserId === req.userId) return res.status(400).json({ error: 'Kendinle sohbet açamazsın.' });
     var key = conversationKey(req.userId, peerUserId);
     var conv = Object.values(db.conversations).find(function (c) { return c.key === key; });
     if (!conv) {
@@ -154,15 +155,15 @@ async function main() {
 
   app.get('/api/conversations/:id/messages', authMiddleware, function (req, res) {
     var conv = db.conversations[req.params.id];
-    if (!conv || conv.members.indexOf(req.userId) === -1) return res.status(404).json({ error: 'Sohbet bulunamadi.' });
+    if (!conv || conv.members.indexOf(req.userId) === -1) return res.status(404).json({ error: 'Sohbet bulunamadı.' });
     res.json({ messages: db.messages[req.params.id] || [] });
   });
 
   app.post('/api/schedule', authMiddleware, function (req, res) {
     var conv = db.conversations[req.body.conversationId];
-    if (!conv || conv.members.indexOf(req.userId) === -1) return res.status(404).json({ error: 'Sohbet bulunamadi.' });
+    if (!conv || conv.members.indexOf(req.userId) === -1) return res.status(404).json({ error: 'Sohbet bulunamadı.' });
     var sendAt = Number(req.body.sendAt);
-    if (!sendAt || sendAt < Date.now()) return res.status(400).json({ error: 'Gecerli bir gelecek zaman sec.' });
+    if (!sendAt || sendAt < Date.now()) return res.status(400).json({ error: 'Geçerli bir gelecek zaman seç.' });
     var item = {
       id: uuid(),
       conversationId: conv.id,
