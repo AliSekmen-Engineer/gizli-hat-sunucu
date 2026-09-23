@@ -8,8 +8,10 @@ const path = require('path');
 const http = require('http');
 
 const DB_PATH = path.join(__dirname, 'db.json');
+const MSG_DIR = path.join(__dirname, 'msg_store');
 const PORT = process.env.PORT || 8787;
-const REDIS_KEY = 'gizlihat:db';
+const META_KEY = 'gizlihat:meta';
+const MSG_KEY_PREFIX = 'gizlihat:messages:';
 
 var db = { users: {}, tokens: {}, conversations: {}, messages: {}, scheduled: [] };
 var redisClient = null;
@@ -20,27 +22,85 @@ async function initDb() {
     redisClient = createClient({ url: process.env.REDIS_URL });
     redisClient.on('error', function (err) { console.error('Redis error', err.message); });
     await redisClient.connect();
-    var raw = await redisClient.get(REDIS_KEY);
-    if (raw) db = JSON.parse(raw);
-    console.log('Persistence: Redis (kalici)');
+
+    var raw = await redisClient.get(META_KEY);
+    if (raw) {
+      var meta = JSON.parse(raw);
+      db.users = meta.users || {};
+      db.tokens = meta.tokens || {};
+      db.conversations = meta.conversations || {};
+      db.scheduled = meta.scheduled || [];
+    } else {
+      // one-time migration from the old single-blob key, if present
+      var legacy = await redisClient.get('gizlihat:db');
+      if (legacy) {
+        var old = JSON.parse(legacy);
+        db.users = old.users || {};
+        db.tokens = old.tokens || {};
+        db.conversations = old.conversations || {};
+        db.scheduled = old.scheduled || [];
+        db.messages = old.messages || {};
+        await persistMeta();
+        for (var cid in db.messages) { await persistMessages(cid); }
+        console.log('Migrated legacy single-blob db into split keys.');
+      }
+    }
+
+    // lazy-load: messages are fetched per-conversation on first access (see getConvMessages)
+    console.log('Persistence: Redis (kalici, split keys)');
   } else {
-    if (fs.existsSync(DB_PATH)) db = JSON.parse(fs.readFileSync(DB_PATH, 'utf8'));
+    if (fs.existsSync(DB_PATH)) {
+      var d = JSON.parse(fs.readFileSync(DB_PATH, 'utf8'));
+      db.users = d.users || {}; db.tokens = d.tokens || {}; db.conversations = d.conversations || {};
+      db.scheduled = d.scheduled || []; db.messages = d.messages || {};
+    }
     console.log('Persistence: local file (REDIS_URL yok, gecici olabilir)');
   }
   if (!db.scheduled) db.scheduled = [];
 }
 
-var saveTimer = null;
-function persist() {
-  clearTimeout(saveTimer);
-  saveTimer = setTimeout(function () {
-    var json = JSON.stringify(db);
-    if (redisClient) {
-      redisClient.set(REDIS_KEY, json).catch(function (e) { console.error('Redis save error', e.message); });
-    } else {
-      fs.writeFileSync(DB_PATH, json);
-    }
-  }, 150);
+var metaSaveTimer = null;
+function persistMeta() {
+  return new Promise(function (resolve) {
+    clearTimeout(metaSaveTimer);
+    metaSaveTimer = setTimeout(function () {
+      var meta = { users: db.users, tokens: db.tokens, conversations: db.conversations, scheduled: db.scheduled };
+      var json = JSON.stringify(meta);
+      if (redisClient) {
+        redisClient.set(META_KEY, json).then(resolve).catch(function (e) { console.error('Redis meta save error', e.message); resolve(); });
+      } else {
+        fs.writeFileSync(DB_PATH, JSON.stringify(db));
+        resolve();
+      }
+    }, 150);
+  });
+}
+
+var msgSaveTimers = {};
+function persistMessages(convId) {
+  return new Promise(function (resolve) {
+    clearTimeout(msgSaveTimers[convId]);
+    msgSaveTimers[convId] = setTimeout(function () {
+      var list = db.messages[convId] || [];
+      if (redisClient) {
+        redisClient.set(MSG_KEY_PREFIX + convId, JSON.stringify(list)).then(resolve).catch(function (e) { console.error('Redis msg save error', e.message); resolve(); });
+      } else {
+        fs.writeFileSync(DB_PATH, JSON.stringify(db));
+        resolve();
+      }
+    }, 150);
+  });
+}
+
+async function getConvMessages(convId) {
+  if (db.messages[convId]) return db.messages[convId];
+  if (redisClient) {
+    var raw = await redisClient.get(MSG_KEY_PREFIX + convId);
+    db.messages[convId] = raw ? JSON.parse(raw) : [];
+  } else {
+    db.messages[convId] = db.messages[convId] || [];
+  }
+  return db.messages[convId];
 }
 
 function authMiddleware(req, res, next) {
@@ -64,7 +124,7 @@ function sendTo(sockets, userId, payload) {
   return delivered;
 }
 
-function deliverMessage(sockets, conv, fromUserId, toUserId, msg) {
+async function deliverMessage(sockets, conv, fromUserId, toUserId, msg) {
   var sender = db.users[fromUserId];
   var stored = {
     id: uuid(),
@@ -82,9 +142,9 @@ function deliverMessage(sockets, conv, fromUserId, toUserId, msg) {
     time: Date.now(),
     status: 'sent'
   };
-  db.messages[conv.id] = db.messages[conv.id] || [];
-  db.messages[conv.id].push(stored);
-  persist();
+  var list = await getConvMessages(conv.id);
+  list.push(stored);
+  persistMessages(conv.id);
   var delivered = sendTo(sockets, toUserId, { type: 'message', message: stored });
   stored.status = delivered ? 'delivered' : 'sent';
   return stored;
@@ -114,7 +174,7 @@ async function main() {
     db.users[id] = { id: id, username: username, displayName: displayName || username, passwordHash: bcrypt.hashSync(password, 10), createdAt: Date.now() };
     var token = uuid();
     db.tokens[token] = id;
-    persist();
+    persistMeta();
     res.json({ token: token, userId: id, username: username, displayName: db.users[id].displayName });
   });
 
@@ -125,7 +185,7 @@ async function main() {
     if (!user || !bcrypt.compareSync(password, user.passwordHash)) return res.status(401).json({ error: 'Kullanıcı adı veya şifre hatalı.' });
     var token = uuid();
     db.tokens[token] = user.id;
-    persist();
+    persistMeta();
     res.json({ token: token, userId: user.id, username: user.username, displayName: user.displayName });
   });
 
@@ -147,16 +207,19 @@ async function main() {
       conv = { id: id, key: key, members: [req.userId, peerUserId], createdAt: Date.now() };
       db.conversations[id] = conv;
       db.messages[id] = [];
-      persist();
+      persistMeta();
     }
     var peer = db.users[peerUserId];
     res.json({ conversationId: conv.id, peer: { userId: peer.id, username: peer.username, displayName: peer.displayName } });
   });
 
-  app.get('/api/conversations/:id/messages', authMiddleware, function (req, res) {
+  app.get('/api/conversations/:id/messages', authMiddleware, async function (req, res) {
     var conv = db.conversations[req.params.id];
     if (!conv || conv.members.indexOf(req.userId) === -1) return res.status(404).json({ error: 'Sohbet bulunamadı.' });
-    res.json({ messages: db.messages[req.params.id] || [] });
+    var list = await getConvMessages(req.params.id);
+    var since = Number(req.query.since) || 0;
+    var result = since ? list.filter(function (m) { return m.time > since; }) : list;
+    res.json({ messages: result });
   });
 
   app.post('/api/schedule', authMiddleware, function (req, res) {
@@ -177,7 +240,7 @@ async function main() {
       delivered: false
     };
     db.scheduled.push(item);
-    persist();
+    persistMeta();
     res.json({ ok: true, id: item.id });
   });
 
@@ -185,18 +248,19 @@ async function main() {
   var wss = new WebSocketServer({ server: server, path: '/ws' });
   var sockets = {};
 
-  setInterval(function () {
+  setInterval(async function () {
     var now = Date.now();
     var due = db.scheduled.filter(function (s) { return !s.delivered && s.sendAt <= now; });
     if (!due.length) return;
-    due.forEach(function (s) {
+    for (var i = 0; i < due.length; i++) {
+      var s = due[i];
       var conv = db.conversations[s.conversationId];
-      if (!conv) { s.delivered = true; return; }
+      if (!conv) { s.delivered = true; continue; }
       var peerId = conv.members.find(function (m) { return m !== s.fromUserId; });
-      deliverMessage(sockets, conv, s.fromUserId, peerId, s);
+      await deliverMessage(sockets, conv, s.fromUserId, peerId, s);
       s.delivered = true;
-    });
-    persist();
+    }
+    persistMeta();
   }, 15000);
 
   wss.on('connection', function (ws, req) {
@@ -209,7 +273,7 @@ async function main() {
     sockets[userId].add(ws);
     ws.send(JSON.stringify({ type: 'ready', userId: userId }));
 
-    ws.on('message', function (raw) {
+    ws.on('message', async function (raw) {
       var msg;
       try { msg = JSON.parse(raw); } catch (e) { return; }
       var conv = db.conversations[msg.conversationId];
@@ -217,14 +281,15 @@ async function main() {
       var peerId = conv.members.find(function (m) { return m !== userId; });
 
       if (msg.type === 'message') {
-        var stored = deliverMessage(sockets, conv, userId, peerId, msg);
+        var stored = await deliverMessage(sockets, conv, userId, peerId, msg);
         ws.send(JSON.stringify({ type: 'ack', localId: msg.localId, message: stored }));
       } else if (msg.type === 'typing') {
         sendTo(sockets, peerId, { type: 'typing', conversationId: conv.id, fromUserId: userId });
       } else if (msg.type === 'read') {
-        var list = db.messages[conv.id] || [];
-        list.forEach(function (m) { if (m.fromUserId === peerId) m.status = 'read'; });
-        persist();
+        var list = await getConvMessages(conv.id);
+        var changed = false;
+        list.forEach(function (m) { if (m.fromUserId === peerId && m.status !== 'read') { m.status = 'read'; changed = true; } });
+        if (changed) persistMessages(conv.id);
         sendTo(sockets, peerId, { type: 'read', conversationId: conv.id });
       }
     });
