@@ -2192,7 +2192,7 @@ html,body{height:100%;}
   async function syncConversation(c){
     if(!c.remote || !online.token) return;
     try{
-      var resp=await apiGet('/api/conversations/'+c.remote.conversationId+'/messages');
+      var since=0; c.messages.forEach(function(m){ if(m.serverTime && m.serverTime>since) since=m.serverTime; }); var resp=await apiGet('/api/conversations/'+c.remote.conversationId+'/messages?since='+since);
       var serverMsgs=resp.messages||[];
       var known={};
       c.messages.forEach(function(m){ if(m.serverId) known[m.serverId]=m; });
@@ -2247,7 +2247,7 @@ html,body{height:100%;}
     if(convOpen){ paintThread(c.messages.length-1); wsSend({type:'read', conversationId:c.remote.conversationId}); }
     var listOpen = screen.classList.contains('unlocked') && !document.getElementById('listView').classList.contains('hidden');
     if(listOpen) paintContacts();
-    if(!c.muted) showDisguisedNotif(false);
+    if(!c.muted) showDisguisedNotif(false, !convOpen);
   }
   function handleTyping(msg){
     var c=getContactByConv(msg.conversationId); if(!c) return;
